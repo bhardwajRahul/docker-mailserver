@@ -15,7 +15,7 @@ jobs:
         github_token: ${{secrets.GITHUB_TOKEN}}
         branches: contributors-update
     - name: Create contributors-update branch
-      uses: peterjgrainger/action-create-branch@v2.0.1
+      uses: peterjgrainger/action-create-branch@v2.1.0
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
