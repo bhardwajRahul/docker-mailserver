@@ -4,12 +4,14 @@ load "${REPOSITORY_ROOT}/test/helper/common"
 BATS_TEST_NAME_PREFIX='[LDAP] '
 CONTAINER1_NAME='dms-test_ldap'
 CONTAINER2_NAME='dms-test_ldap_provider'
+# Single test-case specific containers:
+CONTAINER3_NAME='dms-test_ldap_custom-config'
 
 function setup_file() {
   export DMS_TEST_NETWORK='test-network-ldap'
-  export DOMAIN='example.test'
-  export FQDN_MAIL="mail.${DOMAIN}"
-  export FQDN_LDAP="ldap.${DOMAIN}"
+  export DMS_DOMAIN='example.test'
+  export FQDN_MAIL="mail.${DMS_DOMAIN}"
+  export FQDN_LDAP="ldap.${DMS_DOMAIN}"
   # LDAP is provisioned with two domains (via `.ldif` files) unrelated to the FQDN of DMS:
   export FQDN_LOCALHOST_A='localhost.localdomain'
   export FQDN_LOCALHOST_B='localhost.otherdomain'
@@ -21,11 +23,11 @@ function setup_file() {
   # Setup local openldap service:
   docker run --rm -d --name "${CONTAINER2_NAME}" \
     --env LDAP_ADMIN_PASSWORD=admin \
-    --env LDAP_ROOT='dc=localhost,dc=localdomain' \
+    --env LDAP_ROOT='dc=example,dc=test' \
     --env LDAP_PORT_NUMBER=389 \
     --env LDAP_SKIP_DEFAULT_TREE=yes \
-    --volume './test/config/ldap/docker-openldap/bootstrap/ldif/:/ldifs/:ro' \
-    --volume './test/config/ldap/docker-openldap/bootstrap/schemas/:/schemas/:ro' \
+    --volume "${REPOSITORY_ROOT}/test/config/ldap/openldap/ldifs/:/ldifs/:ro" \
+    --volume "${REPOSITORY_ROOT}/test/config/ldap/openldap/schemas/:/schemas/:ro" \
     --hostname "${FQDN_LDAP}" \
     --network "${DMS_TEST_NETWORK}" \
     bitnami/openldap:latest
@@ -36,34 +38,90 @@ function setup_file() {
   # Setup DMS container
   #
 
+  # LDAP filter queries explained.
+  # NOTE: All LDAP configs for Postfix (with the exception of `ldap-senders.cf`), return the `mail` attribute value of matched results.
+  # This is through the config key `result_attribute`, which the ENV substitution feature can only replace across all configs, not selectively like `query_filter`.
+  # NOTE: The queries below rely specifically upon attributes and classes defined by the schema `postfix-book.ldif`. These are not compatible with all LDAP setups.
+
+  # `mailAlias`` is supported by both classes provided from the schema `postfix-book.ldif`, but `mailEnabled` is only available to `PostfixBookMailAccount` class:
+  local QUERY_ALIAS='(&(mailAlias=%s) (| (objectClass=PostfixBookMailForward) (&(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)) ))'
+
+  # Postfix does domain lookups with the domain of the recipient to check if DMS manages the mail domain.
+  # For this lookup `%s` only represents the domain, not a full email address. Hence the match pattern using a wildcard prefix `*@`.
+  # For a breakdown, see QUERY_SENDERS comment.
+  # NOTE: Although `result_attribute = mail` will return each accounts full email address, Postfix will only compare to domain-part.
+  local QUERY_DOMAIN='(| (& (|(mail=*@%s) (mailAlias=*@%s) (mailGroupMember=*@%s)) (&(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)) ) (&(mailAlias=*@%s)(objectClass=PostfixBookMailForward)) )'
+
+  # Simple queries for a single attribute that additionally requires `mailEnabled=TRUE` from the `PostfixBookMailAccount` class:
+  # NOTE: `mail` attribute is not unique to `PostfixBookMailAccount`. The `mailEnabled` attribute is to further control valid mail accounts.
+  # TODO: For tests, since `mailEnabled` is not relevant (always configured as TRUE currently),
+  # a simpler query like `mail=%s` or `mailGroupMember=%s` would be sufficient. The additional constraints could be covered in our docs instead.
+  local QUERY_GROUP='(&(mailGroupMember=%s) (&(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)) )'
+  local QUERY_USER='(&(mail=%s) (&(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)) )'
+
+  # Given the sender address `%s` from Postfix, query LDAP for accounts that meet the search filter,
+  # the `result_attribute` is `mail` + `uid` (`userID`) attributes for login names that are authorized to use that sender address.
+  # One of the result values returned must match the login name of the user trying to send mail with that sender address.
+  #
+  # Filter: Search for accounts that meet any of the following conditions:
+  # - Has any attribute (`mail`, `mailAlias`, `mailGroupMember`) with a value of `%s`, AND is of class `PostfixBookMailAccount` with `mailEnabled=TRUE` attribute set.
+  # - Has attribute `mailAlias` with value of `%s` AND is of class PostfixBookMailForward
+  # - Has the attribute `userID` with value `some.user.id`
+  local QUERY_SENDERS='(| (& (|(mail=%s) (mailAlias=%s) (mailGroupMember=%s)) (&(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)) ) (&(mailAlias=%s)(objectClass=PostfixBookMailForward)) (userID=some.user.id))'
+
+  # NOTE: The remaining queries below have been left as they were instead of rewritten, `mailEnabled` has no associated class requirement, nor does the class requirement ensure `mailEnabled=TRUE`.
+
+  # When using SASLAuthd for login auth (only valid to Postfix in DMS),
+  # Postfix will pass on the login username and SASLAuthd will use it's backend to do a lookup.
+  # The current default is `uniqueIdentifier=%u`, but `%u` is inaccurate currently with LDAP backend
+  # as SASLAuthd will ignore the domain-part received (if any) and forward only the local-part as the query.
+  # TODO: Fix this by having supervisor start the service with `-r` option like it does `rimap` backend.
+  # NOTE: `%u` (full login with realm/domain-part) is presently equivalent to `%U` (local-part) only,
+  # As the `userID` is not a mail address, we ensure any domain-part is ignored, as a login name is not
+  # required to match the mail accounts actual `mail` attribute (nor the local-part), they are distinct.
+  # TODO: Docs should better cover this difference, as it does confuse some users of DMS (and past contributors to our tests..).
+  local SASLAUTHD_QUERY='(&(userID=%U)(mailEnabled=TRUE))'
+
+  # Dovecot is configured to lookup a user account by their login name (`userID` in this case, but it could be any attribute like `mail`).
+  # Dovecot syntax token `%n` is the local-part of the full email address supplied as the login name. There must be a unique match on `userID` (which there will be as each account is configured via LDIF to use it in their DN)
+  # NOTE: We already have a constraint on the LDAP tree to search (`LDAP_SEARCH_BASE`), if all objects in that subtree use `PostfixBookMailAccount` class then there is no benefit in the extra constraint.
+  # TODO: For tests, that additional constraint is meaningless. We can detail it in our docs instead and just use `userID=%n`.
+  local DOVECOT_QUERY_PASS='(&(userID=%n)(objectClass=PostfixBookMailAccount))'
+  local DOVECOT_QUERY_USER='(&(userID=%n)(objectClass=PostfixBookMailAccount))'
+
   local ENV_LDAP_CONFIG=(
-    # Configure for LDAP account provisioner and alternative to Dovecot SASL:
     --env ACCOUNT_PROVISIONER=LDAP
+
+    # Common LDAP ENV:
+    # NOTE: `scripts/startup/setup.d/ldap.sh:_setup_ldap()` uses `_replace_by_env_in_file()` to configure settings (stripping `DOVECOT_` / `LDAP_` prefixes):
+    --env LDAP_SERVER_HOST="ldap://${FQDN_LDAP}"
+    --env LDAP_SEARCH_BASE='ou=users,dc=example,dc=test'
+    --env LDAP_START_TLS=no
+    # Credentials needed for read access to LDAP_SEARCH_BASE:
+    --env LDAP_BIND_DN='cn=admin,dc=example,dc=test'
+    --env LDAP_BIND_PW='admin'
+
+    # Postfix SASL auth provider (SASLAuthd instead of default Dovecot provider):
     --env ENABLE_SASLAUTHD=1
     --env SASLAUTHD_MECHANISMS=ldap
+    --env SASLAUTHD_LDAP_FILTER="${SASLAUTHD_QUERY}"
 
     # ENV to configure LDAP configs for Dovecot + Postfix:
-    # NOTE: `scripts/startup/setup.d/ldap.sh:_setup_ldap()` uses `_replace_by_env_in_file()` to configure settings (stripping `DOVECOT_` / `LDAP_` prefixes):
     # Dovecot:
-    --env DOVECOT_PASS_FILTER='(&(objectClass=PostfixBookMailAccount)(uniqueIdentifier=%n))'
+    --env DOVECOT_PASS_FILTER="${DOVECOT_QUERY_PASS}"
+    --env DOVECOT_USER_FILTER="${DOVECOT_QUERY_USER}"
     --env DOVECOT_TLS=no
-    --env DOVECOT_USER_FILTER='(&(objectClass=PostfixBookMailAccount)(uniqueIdentifier=%n))'
+
     # Postfix:
-    --env LDAP_BIND_DN='cn=admin,dc=localhost,dc=localdomain'
-    --env LDAP_BIND_PW='admin'
-    --env LDAP_QUERY_FILTER_ALIAS='(|(&(mailAlias=%s)(objectClass=PostfixBookMailForward))(&(mailAlias=%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)))'
-    --env LDAP_QUERY_FILTER_DOMAIN='(|(&(mail=*@%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE))(&(mailGroupMember=*@%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE))(&(mailalias=*@%s)(objectClass=PostfixBookMailForward)))'
-    --env LDAP_QUERY_FILTER_GROUP='(&(mailGroupMember=%s)(mailEnabled=TRUE))'
-    --env LDAP_QUERY_FILTER_SENDERS='(|(&(mail=%s)(mailEnabled=TRUE))(&(mailGroupMember=%s)(mailEnabled=TRUE))(|(&(mailAlias=%s)(objectClass=PostfixBookMailForward))(&(mailAlias=%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)))(uniqueIdentifier=some.user.id))'
-    --env LDAP_QUERY_FILTER_USER='(&(mail=%s)(mailEnabled=TRUE))'
-    --env LDAP_SEARCH_BASE='ou=people,dc=localhost,dc=localdomain'
-    --env LDAP_SERVER_HOST="${FQDN_LDAP}"
-    --env LDAP_START_TLS=no
+    --env LDAP_QUERY_FILTER_ALIAS="${QUERY_ALIAS}"
+    --env LDAP_QUERY_FILTER_DOMAIN="${QUERY_DOMAIN}"
+    --env LDAP_QUERY_FILTER_GROUP="${QUERY_GROUP}"
+    --env LDAP_QUERY_FILTER_SENDERS="${QUERY_SENDERS}"
+    --env LDAP_QUERY_FILTER_USER="${QUERY_USER}"
   )
 
-  # Extra ENV needed to support specific testcases:
+  # Extra ENV needed to support specific test-cases:
   local ENV_SUPPORT=(
-    --env PERMIT_DOCKER=container # Required for attempting SMTP auth on port 25 via nc
     # Required for openssl commands to be successul:
     # NOTE: snakeoil cert is created (for `docker-mailserver.invalid`) via Debian post-install script for Postfix package.
     # TODO: Use proper TLS cert
@@ -76,27 +134,56 @@ function setup_file() {
     --env SPOOF_PROTECTION=1
   )
 
+  export CONTAINER_NAME=${CONTAINER1_NAME}
   local CUSTOM_SETUP_ARGUMENTS=(
-    --hostname "${FQDN_MAIL}"
-    --network "${DMS_TEST_NETWORK}"
-
     "${ENV_LDAP_CONFIG[@]}"
     "${ENV_SUPPORT[@]}"
+
+    --hostname "${FQDN_MAIL}"
+    --network "${DMS_TEST_NETWORK}"
   )
 
-  # Set default implicit container fallback for helpers:
-  export CONTAINER_NAME=${CONTAINER1_NAME}
+  _init_with_defaults
+  _common_container_setup 'CUSTOM_SETUP_ARGUMENTS'
+  _wait_for_smtp_port_in_container
 
+  # Single test-case containers below cannot be defined in a test-case when expanding arrays
+  # defined in `setup()`. Those arrays would need to be hoisted up to the top of the file vars.
+  # Alternatively for ENV overrides, separate `.env` files could be used. Better options
+  # are available once switching to `compose.yaml` in tests.
+
+  export CONTAINER_NAME=${CONTAINER3_NAME}
+  local CUSTOM_SETUP_ARGUMENTS=(
+    "${ENV_LDAP_CONFIG[@]}"
+
+    # `hostname` should be unique when connecting containers via network:
+    --hostname "custom-config.${DMS_DOMAIN}"
+    --network "${DMS_TEST_NETWORK}"
+  )
   _init_with_defaults
   # NOTE: `test/config/` has now been duplicated, can move test specific files to host-side `/tmp/docker-mailserver`:
   mv "${TEST_TMP_CONFIG}/ldap/overrides/"*.cf "${TEST_TMP_CONFIG}/"
   _common_container_setup 'CUSTOM_SETUP_ARGUMENTS'
-  _wait_for_smtp_port_in_container
+
+
+  # Set default implicit container fallback for helpers:
+  export CONTAINER_NAME=${CONTAINER1_NAME}
 }
 
 function teardown_file() {
   docker rm -f "${CONTAINER1_NAME}" "${CONTAINER2_NAME}"
   docker network rm "${DMS_TEST_NETWORK}"
+}
+
+# Could optionally call `_default_teardown` in test-cases that have specific containers.
+# This will otherwise handle it implicitly which is helpful when the test-case hits a failure,
+# As failure will bail early missing teardown, which then prevents network cleanup. This way is safer:
+function teardown() {
+  if [[ ${CONTAINER_NAME} != "${CONTAINER1_NAME}" ]] \
+  && [[ ${CONTAINER_NAME} != "${CONTAINER2_NAME}" ]]
+  then
+    _default_teardown
+  fi
 }
 
 # postfix
@@ -108,7 +195,7 @@ function teardown_file() {
   # Test email receiving from a other domain then the primary domain of the mailserver
   _should_exist_in_ldap_tables "some.other.user@${FQDN_LOCALHOST_B}"
 
-  # Should not require `uniqueIdentifier` to match the local part of `mail` (`.ldif` defined settings):
+  # Should not require `userID` / `uid` to match the local part of `mail` (`.ldif` defined settings):
   # REF: https://github.com/docker-mailserver/docker-mailserver/pull/642#issuecomment-313916384
   # NOTE: This account has no `mailAlias` or `mailGroupMember` defined in it's `.ldif`.
   local MAIL_ACCOUNT="some.user.email@${FQDN_LOCALHOST_A}"
@@ -118,9 +205,10 @@ function teardown_file() {
 }
 
 # Custom LDAP config files support:
-# TODO: Compare to provided configs and if they're just including a test comment,
-# could just copy the config and append without carrying a separate test config?
 @test "postfix: ldap custom config files copied" {
+  # Use the test-case specific container from `setup()` (change only applies to test-case):
+  export CONTAINER_NAME=${CONTAINER3_NAME}
+
   local LDAP_CONFIGS_POSTFIX=(
     /etc/postfix/ldap-users.cf
     /etc/postfix/ldap-groups.cf
@@ -135,10 +223,10 @@ function teardown_file() {
 
 @test "postfix: ldap config overwrites success" {
   local LDAP_SETTINGS_POSTFIX=(
-    "server_host = ${FQDN_LDAP}"
+    "server_host = ldap://${FQDN_LDAP}"
     'start_tls = no'
-    'search_base = ou=people,dc=localhost,dc=localdomain'
-    'bind_dn = cn=admin,dc=localhost,dc=localdomain'
+    'search_base = ou=users,dc=example,dc=test'
+    'bind_dn = cn=admin,dc=example,dc=test'
   )
 
   for LDAP_SETTING in "${LDAP_SETTINGS_POSTFIX[@]}"; do
@@ -160,7 +248,7 @@ function teardown_file() {
 
 # dovecot
 @test "dovecot: ldap imap connection and authentication works" {
-  _run_in_container_bash 'nc -w 1 0.0.0.0 143 < /tmp/docker-mailserver-test/auth/imap-ldap-auth.txt'
+  _nc_wrapper 'auth/imap-ldap-auth.txt' '-w 1 0.0.0.0 143'
   assert_success
 }
 
@@ -177,8 +265,8 @@ function teardown_file() {
   local LDAP_SETTINGS_DOVECOT=(
     "uris = ldap://${FQDN_LDAP}"
     'tls = no'
-    'base = ou=people,dc=localhost,dc=localdomain'
-    'dn = cn=admin,dc=localhost,dc=localdomain'
+    'base = ou=users,dc=example,dc=test'
+    'dn = cn=admin,dc=example,dc=test'
   )
 
   for LDAP_SETTING in "${LDAP_SETTINGS_DOVECOT[@]}"; do
@@ -238,12 +326,26 @@ function teardown_file() {
 @test "spoofing (with LDAP): rejects sender forging" {
   _wait_for_smtp_port_in_container_to_respond dms-test_ldap
 
-  _run_in_container_bash 'openssl s_client -quiet -connect 0.0.0.0:465 < /tmp/docker-mailserver-test/auth/ldap-smtp-auth-spoofed.txt'
+  _send_email --expect-rejection \
+    --port 465 -tlsc --auth PLAIN \
+    --auth-user some.user@localhost.localdomain \
+    --auth-password secret \
+    --ehlo mail \
+    --from ldap@localhost.localdomain \
+    --data 'auth/ldap-smtp-auth-spoofed.txt'
+  assert_failure
   assert_output --partial 'Sender address rejected: not owned by user'
 }
 
 @test "spoofing (with LDAP): accepts sending as alias" {
-  _run_in_container_bash 'openssl s_client -quiet -connect 0.0.0.0:465 < /tmp/docker-mailserver-test/auth/ldap-smtp-auth-spoofed-alias.txt'
+  _send_email \
+    --port 465 -tlsc --auth PLAIN \
+    --auth-user some.user@localhost.localdomain \
+    --auth-password secret \
+    --ehlo mail \
+    --from postmaster@localhost.localdomain \
+    --to some.user@localhost.localdomain \
+    --data 'auth/ldap-smtp-auth-spoofed-alias.txt'
   assert_output --partial 'End data with'
 }
 
@@ -252,19 +354,42 @@ function teardown_file() {
   # Template used has invalid AUTH: https://github.com/docker-mailserver/docker-mailserver/pull/3006#discussion_r1073321432
   skip 'TODO: This test seems to have been broken from the start (?)'
 
-  _run_in_container_bash 'openssl s_client -quiet -connect 0.0.0.0:465 < /tmp/docker-mailserver-test/auth/ldap-smtp-auth-spoofed-sender-with-filter-exception.txt'
+  _send_email --expect-rejection \
+    --port 465 -tlsc --auth PLAIN \
+    --auth-user some.user.email@localhost.localdomain \
+    --auth-password secret \
+    --ehlo mail \
+    --from randomspoofedaddress@localhost.localdomain \
+    --to some.user@localhost.localdomain \
+    --data 'auth/ldap-smtp-auth-spoofed-sender-with-filter-exception.txt'
+  assert_failure
   assert_output --partial 'Sender address rejected: not owned by user'
 }
 
 @test "saslauthd: ldap smtp authentication" {
-  # Requires ENV `PERMIT_DOCKER=container`
-  _send_email 'auth/sasl-ldap-smtp-auth' '-w 5 0.0.0.0 25'
-  assert_output --partial 'Error: authentication not enabled'
+  _send_email --expect-rejection \
+    --auth PLAIN \
+    --auth-user some.user@localhost.localdomain \
+    --auth-password wrongpassword \
+    --quit-after AUTH
+  assert_failure
+  assert_output --partial 'Host did not advertise authentication'
 
-  _run_in_container_bash 'openssl s_client -quiet -connect 0.0.0.0:465 < /tmp/docker-mailserver-test/auth/sasl-ldap-smtp-auth.txt'
+  _send_email \
+    --port 465 -tlsc \
+    --auth LOGIN \
+    --auth-user some.user@localhost.localdomain \
+    --auth-password secret \
+    --quit-after AUTH
   assert_output --partial 'Authentication successful'
 
-  _run_in_container_bash 'openssl s_client -quiet -starttls smtp -connect 0.0.0.0:587 < /tmp/docker-mailserver-test/auth/sasl-ldap-smtp-auth.txt'
+  _send_email \
+    --port 587 -tls \
+    --auth PLAIN \
+    --auth-user some.user@localhost.localdomain \
+    --auth-password secret \
+    --quit-after AUTH
+  assert_success
   assert_output --partial 'Authentication successful'
 }
 
@@ -302,7 +427,7 @@ function _should_successfully_deliver_mail_to() {
   local SENDER_ADDRESS='user@external.tld'
   local RECIPIENT_ADDRESS=${1:?Recipient address is required}
   local MAIL_STORAGE_RECIPIENT=${2:?Recipient storage location is required}
-  local MAIL_TEMPLATE='/tmp/docker-mailserver-test/email-templates/test-email.txt'
+  local MAIL_TEMPLATE='/tmp/docker-mailserver-test/emails/test-email.txt'
 
   _run_in_container_bash "sendmail -f ${SENDER_ADDRESS} ${RECIPIENT_ADDRESS} < ${MAIL_TEMPLATE}"
   _wait_for_empty_mail_queue_in_container
